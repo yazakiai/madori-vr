@@ -38,6 +38,10 @@
   </div>
   <div class="step"><b>2. 家の中に入る</b>
     <div class="row"><button id="enter" disabled>VRで入る</button><button id="flat" disabled>画面で見る</button></div>
+    <div class="row" style="margin-top:12px"><span class="opt">はじめの場所：</span>
+      <label class="opt"><input type="radio" name="start" value="entry" checked>玄関</label>
+      <label class="opt"><input type="radio" name="start" value="center">家の真ん中</label>
+      <label class="opt"><input type="radio" name="start" value="outside">家の前（外）</label></div>
     <div class="row" style="margin-top:12px"><label class="opt"><input id="seated" type="checkbox">座って使う（目の高さを足す）</label>
       <label class="opt"><input id="smooth" type="checkbox">なめらかに向きを変える</label></div>
   </div>
@@ -150,10 +154,10 @@ async function load(name, size, read) {
     data = (gltf.parser.json.extras || {}).madori || null;
     if (!data) {
       // 歩くためのデータが無いファイル：家の外側から見るだけ
-      const b = new THREE.Box3().setFromObject(house), c = b.getCenter(new THREE.Vector3());
-      data = { levels: [{ level: 0, y: 0, base: b.min.y, walls: [], floors: [] }], stairs: [], spawn: [c.x, b.max.z + 3, 0] };
+      const b = houseBox(), c = [(b[0] + b[2])/2, (b[1] + b[3])/2];
+      data = { levels: [{ level: 0, y: 0, base: 0, walls: [], floors: [] }], stairs: [], spawn: [c[0], c[1], 0], box: b };
       status('読み込みました（古い書き出し方のファイルなので、壁の当たり判定はありません）');
-    } else status('読み込みました：' + (data.name || f.name));
+    } else { data.box = floorBox() || houseBox(); status('読み込みました：' + (data.name || f.name)); }
     $('enter').disabled = !navigator.xr; $('flat').disabled = false;
     if (!navigator.xr) status($('status').textContent + '／この画面ではVRが使えません（Quest のブラウザで開いてください）');
     else navigator.xr.isSessionSupported('immersive-vr').then(ok => { if (!ok) { $('enter').disabled = true; status($('status').textContent + '／VRに対応していない画面です'); } });
@@ -161,10 +165,44 @@ async function load(name, size, read) {
   } catch (err) { status('読み込めませんでした：' + err.message); }
 }
 
+/* 家の範囲 [x0, z0, x1, z1]：壁の高さ（床から0.3〜2.3m）にある頂点だけで測る（広い地面を入れないため） */
+function houseBox() {
+  let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+  house.updateMatrixWorld(true);
+  const v = new THREE.Vector3();
+  house.traverse(o => {
+    if (!o.isMesh) return;
+    const pa = o.geometry.attributes.position;
+    for (let i = 0; i < pa.count; i += 3) {
+      v.fromBufferAttribute(pa, i).applyMatrix4(o.matrixWorld);
+      if (v.y < 0.3 || v.y > 2.3) continue;
+      x0 = Math.min(x0, v.x); z0 = Math.min(z0, v.z); x1 = Math.max(x1, v.x); z1 = Math.max(z1, v.z);
+    }
+  });
+  return isFinite(x0) ? [x0, z0, x1, z1] : [-5, -5, 5, 5];
+}
+/* 1階の部屋の床の範囲 */
+function floorBox() {
+  const fl = (data.levels[0] || {}).floors || [];
+  if (!fl.length) return null;
+  let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+  for (const f of fl) for (const p of f.p) { x0 = Math.min(x0, p[0]); z0 = Math.min(z0, p[1]); x1 = Math.max(x1, p[0]); z1 = Math.max(z1, p[1]); }
+  return [x0, z0, x1, z1];
+}
+/* はじめの場所：玄関（書き出したときの場所）／家の真ん中／家の前（外から家を向く） */
+function startPoint() {
+  const mode = (document.querySelector('input[name=start]:checked') || {}).value || 'entry', b = data.box;
+  if (mode === 'center' && b) return [(b[0] + b[2])/2, (b[1] + b[3])/2, data.spawn[2]];
+  if (mode === 'outside' && b) return [(b[0] + b[2])/2, b[3] + 3, 0];
+  return data.spawn;
+}
+let pendingSpawn = false;
 /* はじめの場所に立つ */
 function spawn() {
   level = 0;
-  const [x, z, yaw] = data.spawn;
+  const [x0, z0, yaw] = startPoint();
+  // 壁や家具に重なっていたら、少し動かして空いている場所に立つ
+  const [x, z] = collide(x0, z0);
   rig.rotation.set(0, yaw, 0);
   curY = floorAt(x, z);
   placeHead(x, z);
@@ -187,7 +225,7 @@ $('enter').addEventListener('click', async () => {
     await renderer.xr.setSession(s);
     $('ui').classList.add('hidden');
     camera.position.set(0, 0, 0); camera.rotation.set(0, 0, 0);
-    spawn();
+    pendingSpawn = true;      // 頭の位置がわかる最初の1コマで立たせる
     s.addEventListener('end', () => $('ui').classList.remove('hidden'));
   } catch (err) { status('VRに入れませんでした：' + err.message); }
 });
@@ -220,6 +258,7 @@ renderer.setAnimationLoop(() => {
   const now = performance.now(), dt = Math.min(0.05, (now - last)/1000); last = now;
   if (!data) { renderer.render(scene, camera); return; }
   const xr = renderer.xr.isPresenting;
+  if (pendingSpawn && xr) { renderer.render(scene, camera); spawn(); pendingSpawn = false; }
   let mx = 0, mz = 0, turn = 0, reset = false;
   if (xr) {
     for (const src of renderer.xr.getSession().inputSources) {
